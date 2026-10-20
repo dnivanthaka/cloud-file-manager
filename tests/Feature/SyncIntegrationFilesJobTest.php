@@ -1,11 +1,12 @@
-<?php 
+<?php
+
 declare(strict_types=1);
 
-use App\Models\User;
-use App\Models\Integration;
-use App\Models\CloudFile;
 use App\Enums\ProviderType;
 use App\Jobs\SyncIntegrationFilesJob;
+use App\Models\CloudFile;
+use App\Models\Integration;
+use App\Models\User;
 use App\Services\TokenRefreshService;
 use Google\Client as GoogleClient;
 use Google\Service\Drive as GoogleDriveService;
@@ -17,15 +18,15 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     $this->user = User::factory()->create();
-    
+
     $this->integration = Integration::create([
-        'user_id'                 => $this->user->id,
-        'provider'                => ProviderType::GOOGLE,
-        'account_email'           => 'test-user@gmail.com',
-        'account_name'            => 'Test Dev Workspace',
-        'access_token'            => 'valid-stub-token',
-        'refresh_token'           => 'valid-long-lived-refresh-token',
-        'expires_at'              => time() + 3600, 
+        'user_id' => $this->user->id,
+        'provider' => ProviderType::GOOGLE,
+        'account_email' => 'test-user@gmail.com',
+        'account_name' => 'Test Dev Workspace',
+        'access_token' => 'valid-stub-token',
+        'refresh_token' => 'valid-long-lived-refresh-token',
+        'expires_at' => time() + 3600,
     ]);
 
     // Mock the Google Client globally for all tests to isolate network calls
@@ -41,7 +42,7 @@ test('it processes and bulk inserts items from google drive sdk into database ta
         ->with($this->integration)
         ->andReturn('valid-stub-token');
 
-    $mockFile1 = new DriveFile();
+    $mockFile1 = new DriveFile;
     $mockFile1->setId('google-file-id-123');
     $mockFile1->setName('Comprehensive Budget Report.xlsx');
     $mockFile1->setMimeType('application/vnd.ms-excel');
@@ -50,7 +51,7 @@ test('it processes and bulk inserts items from google drive sdk into database ta
     $mockFile1->setMd5Checksum('hash-checksum-signature-aaa');
     $mockFile1->setParents(['root']);
 
-    $mockFolder = new DriveFile();
+    $mockFolder = new DriveFile;
     $mockFolder->setId('google-folder-id-999');
     $mockFolder->setName('Archive Resources');
     $mockFolder->setMimeType('application/vnd.google-apps.folder');
@@ -59,7 +60,7 @@ test('it processes and bulk inserts items from google drive sdk into database ta
     $mockFolder->setMd5Checksum(null);
     $mockFolder->setParents(['root']);
 
-    $mockFileList = new FileList();
+    $mockFileList = new FileList;
     $mockFileList->setFiles([$mockFile1, $mockFolder]);
     $mockFileList->setNextPageToken(null);
 
@@ -83,27 +84,27 @@ test('it processes and bulk inserts items from google drive sdk into database ta
 
 test('it utilizes memory maps to skip writing unchanged files when checksum matches', function () {
     CloudFile::create([
-        'user_id'          => $this->user->id,
-        'integration_id'   => $this->integration->id,
+        'user_id' => $this->user->id,
+        'integration_id' => $this->integration->id,
         'provider_file_id' => 'cached-file-777',
-        'name'             => 'Static Document.pdf',
-        'mime_type'        => 'application/pdf',
-        'view_link'        => 'https://google.com',
-        'checksum'         => 'identical-md5-hash-signature',
-        'is_folder'        => false
+        'name' => 'Static Document.pdf',
+        'mime_type' => 'application/pdf',
+        'view_link' => 'https://google.com',
+        'checksum' => 'identical-md5-hash-signature',
+        'is_folder' => false,
     ]);
 
     $tokenServiceMock = mock(TokenRefreshService::class);
     $tokenServiceMock->shouldReceive('getValidToken')->andReturn('valid-stub-token');
 
-    $unchangedSdkFile = new DriveFile();
+    $unchangedSdkFile = new DriveFile;
     $unchangedSdkFile->setId('cached-file-777');
     $unchangedSdkFile->setName('Static Document.pdf');
     $unchangedSdkFile->setMimeType('application/pdf');
     $unchangedSdkFile->setMd5Checksum('identical-md5-hash-signature');
     $unchangedSdkFile->setParents(['root']);
 
-    $mockFileList = new FileList();
+    $mockFileList = new FileList;
     $mockFileList->setFiles([$unchangedSdkFile]);
     $mockFileList->setNextPageToken(null);
 

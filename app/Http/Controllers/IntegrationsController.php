@@ -16,6 +16,7 @@ use Laravel\Socialite\Facades\Socialite;
 class IntegrationsController extends Controller
 {
     private const ONE_YEAR_IN_SECONDS = 60 * 60 * 24 * 365;
+
     // Inject your refactored Token Refresh Service directly into the constructor
     public function __construct(protected TokenRefreshService $tokenService) {}
 
