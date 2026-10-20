@@ -1,6 +1,4 @@
-<?php
-
-declare(strict_types=1);
+<?php declare(strict_types=1);
 
 namespace App\Jobs;
 
@@ -12,19 +10,19 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Generator;
 
 class SyncIntegrationFilesJob implements ShouldQueue
 {
     use Queueable;
 
-    private const int CHUNK_SIZE = 500;
+    protected Integration $integration;
+    public int $timeout = 900;
+    public int $tries = 3;
 
-    public $timeout = 900;
-
-    public $tries = 3;
-
-    public function __construct(protected Integration $integration)
+    public function __construct(Integration $integration)
     {
+        $this->integration = $integration;
         $this->onQueue('sync');
     }
 
@@ -34,107 +32,134 @@ class SyncIntegrationFilesJob implements ShouldQueue
             $accessToken = $tokenService->getValidToken($this->integration);
             $provider = $this->integration->provider->value;
 
+            Log::info("Starting high-throughput generator sync loop for integration ID: {$this->integration->id}");
+
             if ($provider === 'google') {
-                $this->syncWithGoogleSdkBulk($accessToken);
+                $this->syncGoogleDrive($accessToken);
             }
 
         } catch (\Exception $e) {
-            Log::error('Bulk sync background SDK exception caught: '.$e->getMessage());
+            Log::error("Bulk generator sync background SDK exception caught: " . $e->getMessage());
             throw $e;
         }
     }
 
-    private function syncWithGoogleSdkBulk(string $token): void
+    /**
+     * Factory method to isolate the instantiation of the Google SDK Client wrapper.
+     */
+    protected function getGoogleDriveService(string $token): GoogleDriveService
     {
-        $client = new GoogleClient;
+        $client = new GoogleClient();
         $client->setAccessToken($token);
-        $driveService = new GoogleDriveService($client);
+        return new GoogleDriveService($client);
+    }
 
-        // 1.MEMORY MAP optimization: Fetch all locally stored file checksums in a single query
-        $existingFilesMap = DB::table('cloud_files')
-            ->where('integration_id', $this->integration->id)
-            //value, key
-            ->pluck('checksum', 'provider_file_id') // Creates an associative array: [ 'file_id' => 'md5_hash' ]
-            ->toArray();
-
+    /**
+     * Lazily streams pages of files out of the Google SDK
+     * 
+     * @return Generator<int, array>
+     */
+    private function fetchGoogleFilesGenerator(GoogleDriveService $driveService): Generator
+    {
         $pageToken = null;
-        $totalProcessed = 0;
-        $totalSkipped = 0;
-
-        $filesChunk = [];
-        $parentsChunk = [];
 
         do {
             $optParams = [
-                'pageSize' => 100,
-                // Explicitly requesting 'md5Checksum' from Google's file resource metadata parameters
-                'fields' => 'nextPageToken, files(id, name, mimeType, size, webViewLink, parents, md5Checksum)',
-                'q' => 'trashed = false',
+                'pageSize'  => 100, // Safe page slice size to protect container memory
+                'fields'    => 'nextPageToken, files(id, name, mimeType, size, webViewLink, parents, md5Checksum)',
+                'q'         => "trashed = false",
                 'pageToken' => $pageToken,
             ];
 
             $results = $driveService->files->listFiles($optParams);
-            $filesList = $results->getFiles();
-            $pageToken = $results->getNextPageToken();
+            $pageToken = $results->getNextPageToken(); // Advance internal cursor pointer
+            
+            // 💡 Yield precisely this page array segment back to our consumer loop
+            yield $results->getFiles();
 
-            foreach ($filesList as $file) {
+        } while ($pageToken !== null);
+    }
+
+    /**
+     * Processes the stream coming out of the generator function.
+     */
+    private function syncGoogleDrive(string $token): void
+    {
+        $driveService = $this->getGoogleDriveService($token);
+
+        // Fetch our lightweight local checksum hash memory map look-up array
+        $existingFilesMap = DB::table('cloud_files')
+            ->where('integration_id', $this->integration->id)
+            ->pluck('checksum', 'provider_file_id')
+            ->toArray();
+
+        $totalProcessed = 0;
+        $totalSkipped = 0;
+        
+        $filesChunk = [];
+        $parentsChunk = [];
+        $chunkSize = 500;
+
+        // 🔄 Consume the lazy streaming generator pages
+        foreach ($this->fetchGoogleFilesGenerator($driveService) as $filesPage) {
+            foreach ($filesPage as $file) {
                 $fileId = $file->getId();
-                // Google lists folders or native docs without hashes; fallback safely to file metadata strings
-                $incomingChecksum = $file->getMd5Checksum() ?? 'no-hash-'.$file->getMimeType();
+                $incomingChecksum = $file->getMd5Checksum() ?? 'no-hash-' . $file->getMimeType();
 
-                // 2. ⚡ THE CHECKSUM DELTA CHECK: Skip compiling if the hash perfectly matches our database, avoiding Laravels object methods as it would create more overhead
+                // Delta hash optimization: skip compiling if the file matches perfectly
                 if (($existingFilesMap[$fileId] ?? null) === $incomingChecksum) {
                     $totalSkipped++;
-
-                    continue; // Instantly skip to the next file without doing anything!
+                    continue;
                 }
 
                 $isFolder = $file->getMimeType() === 'application/vnd.google-apps.folder';
                 $now = now()->toDateTimeString();
 
-                // 3. Accumulate data ONLY for new or physically changed files
+                // Accumulate metadata rows
                 $filesChunk[] = [
-                    'user_id' => $this->integration->user_id,
-                    'integration_id' => $this->integration->id,
+                    'user_id'          => $this->integration->user_id,
+                    'integration_id'   => $this->integration->id,
                     'provider_file_id' => $fileId,
-                    'name' => $file->getName(),
-                    'mime_type' => $file->getMimeType(),
-                    'size' => $file->getSize(),
-                    'view_link' => $file->getWebViewLink(),
-                    'checksum' => $incomingChecksum, // Save the current hash
-                    'is_folder' => $isFolder ? 1 : 0,
-                    'created_at' => $now,
-                    'updated_at' => $now,
+                    'name'             => $file->getName(),
+                    'mime_type'        => $file->getMimeType(),
+                    'size'             => $file->getSize(),
+                    'view_link'        => $file->getWebViewLink(),
+                    'checksum'         => $incomingChecksum,
+                    'is_folder'        => $isFolder ? 1 : 0,
+                    'created_at'       => $now,
+                    'updated_at'       => $now,
                 ];
 
+                // Accumulate parent relationship items
                 $parentIds = $file->getParents() ?? ['root'];
                 foreach ($parentIds as $parentId) {
                     $parentsChunk[] = [
-                        'user_id' => $this->integration->user_id,
-                        'integration_id' => $this->integration->id,
-                        'provider_file_id' => $fileId,
+                        'user_id'            => $this->integration->user_id,
+                        'integration_id'     => $this->integration->id,
+                        'provider_file_id'   => $fileId,
                         'provider_parent_id' => $parentId,
-                        'created_at' => $now,
-                        'updated_at' => $now,
+                        'created_at'         => $now,
+                        'updated_at'         => $now,
                     ];
                 }
 
-                if (count($filesChunk) >= self::CHUNK_SIZE) {
+                // Batch flush to the database when chunks hit our limit boundary
+                if (count($filesChunk) >= $chunkSize) {
                     $this->flushBulkChunks($filesChunk, $parentsChunk);
                     $totalProcessed += count($filesChunk);
                     $filesChunk = [];
                     $parentsChunk = [];
                 }
             }
+        }
 
-        } while ($pageToken !== null);
-
-        if (! empty($filesChunk)) {
+        // Flush any leftover remnants lingering inside the arrays
+        if (!empty($filesChunk)) {
             $this->flushBulkChunks($filesChunk, $parentsChunk);
             $totalProcessed += count($filesChunk);
         }
 
-        Log::info("Delta SDK sync completed. Saved/Updated: {$totalProcessed} files. Unchanged & Skipped: {$totalSkipped} files.");
+        Log::info("Generator sync completed. Saved/Updated: {$totalProcessed} files. Bypassed & Skipped: {$totalSkipped} files.");
     }
 
     private function flushBulkChunks(array $files, array $parents): void
@@ -143,7 +168,6 @@ class SyncIntegrationFilesJob implements ShouldQueue
             DB::table('cloud_files')->upsert(
                 $files,
                 ['integration_id', 'provider_file_id'],
-                // Include checksum in the update field fallback definition ruleset
                 ['name', 'mime_type', 'size', 'view_link', 'checksum', 'is_folder', 'updated_at']
             );
 
